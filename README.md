@@ -1,4 +1,4 @@
-# AutoEnterV3
+# AdvancedMD-AutoEnter
 
 Desktop helpers that speed up data entry in **AdvancedMD PM** on Windows. Each tool takes a
 screenshot (or a PDF/image you pick), uses Google Gemini to read the patient details out of it,
@@ -30,8 +30,8 @@ All three have a small Tkinter GUI (default) and a terminal mode (`--cli`). Pres
 ## Setup
 
 ```powershell
-git clone https://github.com/Heptagon2/AutoEnterV3.git
-cd AutoEnterV3
+git clone https://github.com/Heptagon2/AdvancedMD-AutoEnter.git
+cd AdvancedMD-AutoEnter
 
 python -m venv .venv
 # If activation is blocked: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
