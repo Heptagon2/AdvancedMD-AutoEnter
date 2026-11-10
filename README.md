@@ -13,8 +13,8 @@ and then types those details into the AdvancedMD form for you with `pyautogui`.
 | Script | What it does |
 | --- | --- |
 | `PatientCreatePackage/PatientCreate` | Creates a new patient: reads name, DOB, MRN, sex, phone, address, city and ZIP from a screenshot, fills the *New Patient* form, picks the matching city from the dropdown, and stops if a "Possible Patient Duplicate" banner appears. |
-| `ChargeChopped` | Quick charge entry: reads patient/visit info from a screenshot and fills the name, visit, facility and info fields. |
-| `BatchChopped` | Older batch version of patient entry that works from a PDF or a folder of images. |
+| `BatchChopped` | New patient entry: reads name, DOB, MRN, sex, phone, address and ZIP from a screenshot, PDF or folder of images and fills the new patient form. |
+| `ChargeChopped` | Quick Charge: reads patient and visit info from a screenshot and fills the name, visit, facility and info fields in AdvancedMD's Quick Charge screen. |
 
 All three have a small Tkinter GUI (default) and a terminal mode (`--cli`). Press the `` ` ``
 (backtick) key as a global hotkey once **Hotkey Mode** is turned on.
