@@ -81,8 +81,8 @@ PatientCreatePackage/
   PatientCreate            # new-patient entry tool
   FlagTemplate.png         # image of the duplicate-patient banner (template matching)
   ExampleOfWhiteSpace.png  # reference shown during calibration
-ChargeChopped              # quick charge entry tool
-BatchChopped               # batch PDF/image entry tool
+ChargeChopped              # Quick Charge entry tool
+BatchChopped               # new patient entry tool
 requirements.txt
 .env.example               # copy to .env and add your key
 ```
