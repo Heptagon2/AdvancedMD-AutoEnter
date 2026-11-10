@@ -1,0 +1,659 @@
+from google import generativeai as genai
+import pyautogui
+import pyperclip
+import time
+import keyboard
+import threading
+import json
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import sys
+import re
+from pdf2image import convert_from_path
+import argparse
+import mss
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+Batch_file = False
+Calibrating = False
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller .exe """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+def get_data_path(filename):
+    """ Get path for data files that should persist between app runs """
+    # Use the directory where the exe is located, or current directory for dev
+    try:
+        # If running as exe, use the exe's directory
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.abspath(".")
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, filename)
+
+def convert_pdf_to_images(pdf_path, output_folder="output_images"):
+    os.makedirs(output_folder, exist_ok=True)
+    images = convert_from_path(pdf_path, dpi=300)
+    
+    image_path = []
+    for i, img in enumerate(images):
+        img_pathSingle = os.path.join(output_folder, f"page_{i+1}.png")
+        img.save(img_pathSingle, "PNG")
+        image_path.append(img_pathSingle)
+    
+    return image_path
+
+def load_coordinates():
+    """Load saved coordinates from file"""
+    try:
+        with open(get_data_path("coordinates.json"), "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        tk.messagebox.showerror("Error", "coordinates.json is corrupted. Please delete it and recalibrate.")
+        return None
+
+def save_coordinates(coordinates):
+    """Save coordinates to file"""
+    with open(get_data_path("coordinates.json"), "w") as f:
+        json.dump(coordinates, f, indent=2)
+
+def select_input():
+    """Open file dialog to select input"""
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    
+    file_path = filedialog.askopenfilename(
+        title="Select Screenshot Image/Batch PDF",
+        filetypes=[
+            ("Input files", "*.png *.jpg *.jpeg *.bmp *.gif *.pdf"),
+            ("PNG files", "*.png"),
+            ("JPEG files", "*.jpg *.jpeg"),
+            ("PDF Files", "*.pdf"),
+            ("All files", "*.*"),
+        ]
+    )
+    
+    if not file_path:
+        tk.messagebox.showinfo("Info", "No file selected.")
+        return []
+    
+    if os.path.splitext(file_path)[1].lower() == '.pdf':
+        return convert_pdf_to_images(file_path, output_folder="output_images")
+    else:
+        return [file_path]
+
+def calibrate_positions(gui_status_callback=None):
+    """Calibrate cursor positions for all form fields"""
+    print("Calibrating cursor positions...")
+    print("For each field, hover your mouse over the text box and press ` to save the position")
+    print("You can press Ctrl+C at any time to cancel calibration")
+    
+    coordinates = {}
+    fields = [
+        ("Patient Name", "namexy"),
+        ("Date of Birth", "dateofbirthxy"),
+        ("MRN Number", "mrnnumberxy"),
+        ("Sex", "sexxy"),
+        ("Primary Phone Number Icon", "primaryphonenumberxy"),
+        ("Primary Phone Number", "primaryphonenumberxy2"),
+        ("Primary Phone Number Prefered", "primaryphonenumberxy3"),
+        ("Address", "addressxy"),
+        ("ZIP Code", "zipcodexy")
+    ]
+    
+    for field_name, coord_key in fields:
+        if gui_status_callback:
+            gui_status_callback(f"Calibrating: {field_name}")
+        print(f"\nHover over {field_name} text box and press ` to save position")
+        print("Press Ctrl+C to cancel")
+        
+        stop_event = threading.Event()
+        
+        def listen_for_kill_key():
+            try:
+                keyboard.wait('~')
+                stop_event.set()
+            except KeyboardInterrupt:
+                print("\nCalibration cancelled.")
+                sys.exit(1)
+        
+        # Start the kill-key listener in the background
+        threading.Thread(target=listen_for_kill_key, daemon=True).start()
+        
+        # Main loop: print mouse position until kill key is pressed
+        while not stop_event.is_set():
+            try:
+                print(f"\rCurrent position: {pyautogui.position()}", end="", flush=True)
+                time.sleep(0.1)
+            except KeyboardInterrupt:
+                print("\nCalibration cancelled.")
+                sys.exit(1)
+        
+        position = pyautogui.position()
+        coordinates[coord_key] = {"x": position.x, "y": position.y}
+        print(f"\n{field_name} position saved: {position}")
+        stop_event.clear()
+        time.sleep(0.5)
+    
+    if gui_status_callback:
+        gui_status_callback("")
+    return coordinates
+
+def get_monitor_under_mouse():
+    """Find the monitor where the mouse is currently located."""
+    mouse_x, mouse_y = pyautogui.position()
+
+    with mss.mss() as sct:
+        for monitor in sct.monitors[1:]:  # Skip [0], which is all monitors
+            x1 = monitor["left"]
+            y1 = monitor["top"]
+            x2 = x1 + monitor["width"]
+            y2 = y1 + monitor["height"]
+
+            if x1 <= mouse_x < x2 and y1 <= mouse_y < y2:
+                return monitor
+
+    return None
+
+def screenshot_active_monitor():
+    monitor = get_monitor_under_mouse()
+    if monitor is None:
+        print("Could not determine monitor under mouse.")
+        return
+
+    with mss.mss() as sct:
+        screenshot = sct.grab(monitor)
+        mss.tools.to_png(screenshot.rgb, screenshot.size, output="monitor_under_mouse.png")
+        print("Screenshot saved as monitor_under_mouse.png")
+
+
+def extract_patient_info(image_path):
+    """Extract patient information from screenshot using Gemini AI"""
+    try:
+        # Set API key from environment variable
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
+        genai.configure(api_key=api_key)
+        
+        # Load image from file
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        
+        # Select model
+        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        
+        # Generate response
+        response = model.generate_content([
+            {
+                "role": "user",
+                "parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": image_bytes}},
+                    {"text": """Please identify the the FULL patient/member name(Last, First Middle), date of birth, MRN number, sex, 
+                     primary phone number, COMPLETE address (with BOTH house number AND street name. Do not include city or state), and ZIP code from the image provided.
+                      Format your response in a list, in that order, ommitting any labels or other infomation other than the output. Omit 
+                     any bullet points. Do not give any infomation on the provider. It is extremely important that you give the requested 
+                     infomation in the order and format specified, and you should under no circumstances stray from that format. If you 
+                     cannot find enough infomation to fill the seven requested fields, state could not find, in place of that peice of 
+                     infomation. In the case that you cannot find an MRN number, do not state could not find, but instead fill the field 
+                     with only a '~'.You should under all circumstances still have a list of seven values, no matter what the values may be."""}
+                ]
+            }
+        ])
+        
+        return response.text
+    except Exception as e:
+        print(f"Error extracting information from image: {e}")
+        return None
+
+def unpack_response(response):
+    """Parse the AI response into individual fields and clean address/ZIP"""
+    try:
+        lines = [line.strip() for line in response.strip().split('\n') if line.strip()]
+        
+        if len(lines) < 6:
+            print("Error: AI response doesn't contain enough information.")
+            print("You will have to manually change the information.")
+
+            # Field names and labels to prompt the user
+            field_names = ["PatientName", "DateOfBirth", "MRNNumber", "Sex", "PrimaryPhoneNumber", "Address", "ZipCode"]
+            prompts = ["Patient name", "Date of birth", "MRN Number", "Sex", "Primary phone number", "Address", "ZIP Code"]
+
+            # Temporary storage for values
+            data = {}
+
+            for i, (field, prompt) in enumerate(zip(field_names, prompts)):
+                if i < len(lines):
+                    value = lines[i]
+                else:
+                    value = "MISSING"
+
+                print(f"{prompt} is: {value}")
+                confirmation = input("Press Enter to confirm, or type 'no' to change: ").strip().lower()
+                if confirmation == "no":
+                    corrected = input(f"Type in correction for {prompt}: ").strip()
+                else:
+                    corrected = value
+
+                # For ZipCode, trim to 5 digits
+                if field == "ZipCode":
+                    corrected = corrected[:5]
+
+                data[field] = corrected
+
+            # Unpack variables
+            PatientName = data["PatientName"]
+            DateOfBirth = data["DateOfBirth"]
+            MRNNumber = data["MRNNumber"]
+            Sex = data["Sex"]
+            PrimaryPhoneNumber = data["PrimaryPhoneNumber"]
+            Address = data["Address"]
+            ZipCode = data["ZipCode"]
+
+        if len(lines) == 7:
+                PatientName = lines[0]
+                DateOfBirth = lines[1]
+                MRNNumber = lines[2]
+                Sex = lines[3]
+                PrimaryPhoneNumber = lines[4]
+                Address = lines[5]
+                ZipCode = lines[6][:5]
+        
+        
+        return PatientName, DateOfBirth, MRNNumber, Sex, PrimaryPhoneNumber, Address, ZipCode
+
+    except Exception as e:
+        print(f"Error parsing AI response: {e}")
+        return None
+    
+
+def enter_data(coordinates, patient_data):
+    """Enter patient data into form fields"""
+    PatientName, DateOfBirth, MRNNumber, Sex, PrimaryPhoneNumber, Address, ZipCode = patient_data
+    
+    print("\nEntering data into form...")
+    print("Please ensure the target application is active and ready to receive input.")
+    print("You have 5 seconds to switch to the target application...")
+    #time.sleep(5)
+    
+    # Enter Patient Name
+    try:
+        coord = coordinates["namexy"]
+        x, y = coord["x"], coord["y"]
+        print(f"Entering Patient Name: {PatientName}")
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        pyautogui.click()
+        pyautogui.write(str(PatientName))
+        time.sleep(0.2)
+    except Exception as e:
+        print(f"Error entering Patient Name: {e}")
+    
+    # Enter Date of Birth
+    try:
+        coord = coordinates["dateofbirthxy"]
+        x, y = coord["x"], coord["y"]
+        print(f"Entering Date of Birth: {DateOfBirth}")
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        pyautogui.click()
+        pyautogui.write(str(DateOfBirth))
+        time.sleep(0.2)
+    except Exception as e:
+        print(f"Error entering Date of Birth: {e}")
+    
+    # Enter MRN Number
+    try:
+        coord = coordinates["mrnnumberxy"]
+        x, y = coord["x"], coord["y"]
+        print(f"Entering MRN Number: {MRNNumber}")
+        if MRNNumber == "~":
+            MRNNumber = ""
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        pyautogui.click()
+        pyautogui.write(str(MRNNumber))
+        time.sleep(0.2)
+    except Exception as e:
+        print(f"Error entering MRN Number: {e}")
+    
+    # Enter Sex (dropdown selection)
+    try:
+        coord = coordinates["sexxy"]
+        x, y = coord["x"], coord["y"]
+        print(f"Entering Sex: {Sex}")
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        time.sleep(0.3)
+        pyautogui.write(str(Sex))
+        time.sleep(0.2)
+        pyautogui.press('enter')
+        time.sleep(0.2)
+    except Exception as e:
+        print(f"Error entering Sex: {e}")
+    
+    # Enter Primary Phone Number (with menu interaction)
+    try:
+        coord = coordinates["primaryphonenumberxy"]
+        x, y = coord["x"], coord["y"]
+        print(f"Entering Primary Phone Number: {PrimaryPhoneNumber}")
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        time.sleep(0.5)
+        coord = coordinates["primaryphonenumberxy2"]
+        x, y = coord["x"], coord["y"]
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        pyautogui.click()
+        pyautogui.click()
+        pyautogui.write(str(PrimaryPhoneNumber))
+        time.sleep(0.2)
+        coord = coordinates["primaryphonenumberxy3"]
+        x, y = coord["x"], coord["y"]
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        time.sleep(0.2)
+        pyautogui.press('tab')
+        pyautogui.press('space')
+    except Exception as e:
+        print(f"Error entering Primary Phone Number: {e}")
+    
+    # Enter Address
+    try:
+        coord = coordinates["addressxy"]
+        x, y = coord["x"], coord["y"]
+        print(f"Entering Address: {Address}")
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        pyautogui.click()
+        pyautogui.write(str(Address))
+        time.sleep(0.2)
+    except Exception as e:
+        print(f"Error entering Address: {e}")
+    
+    # Enter ZIP Code (with tab press and extension handling)
+    try:
+        coord = coordinates["zipcodexy"]
+        x, y = coord["x"], coord["y"]
+        print(f"Entering ZIP Code: {ZipCode}")
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        pyautogui.click()
+        if '-' in ZipCode:
+            zip_main = ZipCode.split('-')[0]
+        else:
+            zip_main = ZipCode
+        pyautogui.write(str(zip_main))
+        time.sleep(0.2)
+        pyautogui.press('tab')
+        time.sleep(0.2)
+    except Exception as e:
+        print(f"Error entering ZIP Code: {e}")
+    
+    print("Data entry completed!")
+
+class BatchChoppedApp:
+    def __init__(self, master=None, cli_mode=False):
+        self.cli_mode = cli_mode
+        self.master = master
+        self.hotkey_enabled = False
+        self.calibration_step_event = threading.Event()
+        self.calibrating = False
+        if not cli_mode:
+            self.master.title("BatchChopped - AutoEnter V2")
+            self.status_var = tk.StringVar()
+            self.status_label = tk.Label(master, textvariable=self.status_var)
+            self.status_label.pack()
+            self.main_frame = tk.Frame(master)
+            self.main_frame.pack()
+            self.build_gui()
+            self.review_frame = None
+            self.quit_btn = tk.Button(master, text="Quit", command=self.quit_app)
+            self.quit_btn.pack(pady=5)
+            self.master.protocol("WM_DELETE_WINDOW", self.quit_app)
+            keyboard.add_hotkey('`', self.global_hotkey_handler)
+        self.coordinates = None
+        self.image_paths = []
+        self.current_idx = 0
+        self.patient_data = None
+        self.review_entries = []
+        if not self.cli_mode:
+            self.coordinates = load_coordinates()
+            if not self.coordinates:
+                self.show_info("No saved coordinates found. Please calibrate before continuing.")
+
+    def log(self, msg):
+        if self.cli_mode:
+            print(msg)
+        else:
+            self.status_var.set(msg)
+            self.master.update_idletasks()
+
+    def ask_input(self, prompt):
+        if self.cli_mode:
+            return input(prompt)
+        else:
+            # Simple input dialog
+            from tkinter.simpledialog import askstring
+            return askstring("Input", prompt)
+
+    def ask_yesno(self, prompt):
+        if self.cli_mode:
+            return input(f"{prompt} (yes/no): ").strip().lower() in ["yes", "y"]
+        else:
+            return tk.messagebox.askyesno("Confirm", prompt)
+
+    def show_error(self, msg):
+        if self.cli_mode:
+            print(f"ERROR: {msg}")
+        else:
+            tk.messagebox.showerror("Error", msg)
+
+    def show_info(self, msg):
+        if self.cli_mode:
+            print(msg)
+        else:
+            tk.messagebox.showinfo("Info", msg)
+
+    def build_gui(self):
+        self.select_btn = tk.Button(self.main_frame, text="Select Input File", command=self.select_input_gui)
+        self.select_btn.pack(padx=100,pady=5)
+        self.calib_btn = tk.Button(self.main_frame, text="Calibrate Positions", command=self.calibrate_positions_gui)
+        self.calib_btn.pack(pady=5)
+        # Toggle hotkey/manual mode
+        self.toggle_btn = tk.Button(self.main_frame, text="Hotkey Mode: OFF", command=self.toggle_hotkey_mode)
+        self.toggle_btn.pack(pady=5)
+
+    def select_input_gui(self):
+        self.image_paths = select_input()
+        if self.image_paths:
+            self.log(f"Selected {len(self.image_paths)} images.")
+            self.process_images(self.image_paths)
+
+    def calibrate_positions_gui(self):
+        self.calibrating = True
+        def status_callback(msg):
+            self.status_var.set(msg)
+            self.master.update_idletasks()
+        self.coordinates = self.calibrate_positions(gui_status_callback=status_callback)
+        save_coordinates(self.coordinates)
+        self.log("Calibration complete.")
+        self.calibrating = False
+
+    def calibrate_positions(self, gui_status_callback=None):
+        print("Calibrating cursor positions...")
+        print("For each field, hover your mouse over the text box and press ` to save the position")
+        print("You can press Ctrl+C at any time to cancel calibration")
+        coordinates = {}
+        fields = [
+            ("Patient Name", "namexy"),
+            ("Date of Birth", "dateofbirthxy"),
+            ("MRN Number", "mrnnumberxy"),
+            ("Sex", "sexxy"),
+            ("Primary Phone Number Icon", "primaryphonenumberxy"),
+            ("Primary Phone Number", "primaryphonenumberxy2"),
+            ("Primary Phone Number Prefered", "primaryphonenumberxy3"),
+            ("Address", "addressxy"),
+            ("ZIP Code", "zipcodexy")
+        ]
+        for field_name, coord_key in fields:
+            if gui_status_callback:
+                gui_status_callback(f"Calibrating: {field_name}")
+            print(f"\nHover over {field_name} text box and press ` to save position")
+            print("Press Ctrl+C to cancel")
+            self.calibration_step_event.clear()
+            while True:
+                try:
+                    if self.calibration_step_event.wait(timeout=0.1):
+                        break
+                except KeyboardInterrupt:
+                    print("\nCalibration cancelled.")
+                    sys.exit(1)
+                print(f"\rCurrent position: {pyautogui.position()}", end="", flush=True)
+            position = pyautogui.position()
+            coordinates[coord_key] = {"x": position.x, "y": position.y}
+            print(f"\n{field_name} position saved: {position}")
+            time.sleep(0.5)
+        if gui_status_callback:
+            gui_status_callback("")
+        return coordinates
+
+    def quit_app(self):
+        if self.cli_mode:
+            exit(0)
+        else:
+            self.master.destroy()
+
+    def global_hotkey_handler(self):
+        if self.calibrating:
+            self.calibration_step_event.set()
+        elif self.hotkey_enabled:
+            self.take_and_process_screenshot()
+
+    def take_and_process_screenshot(self):
+        screenshot_active_monitor()
+        image_path = "monitor_under_mouse.png"
+        self.process_images([image_path])
+
+    def process_images(self, image_paths):
+        if not self.coordinates:
+            self.coordinates = load_coordinates()
+        if not self.coordinates:
+            self.show_info("No saved coordinates found. Please calibrate before continuing.")
+            self.calibrate_positions_gui()
+            if not self.coordinates:
+                self.show_error("Calibration failed or cancelled. Cannot continue.")
+                return
+        for idx, image_path in enumerate(image_paths):
+            self.log(f"Processing {image_path} ({idx+1}/{len(image_paths)})...")
+            response = extract_patient_info(image_path)
+            if response is None:
+                self.show_error(f"Failed to extract info from {image_path}")
+                continue
+            patient_data = unpack_response(response)
+            if patient_data is None:
+                self.show_error(f"Failed to parse info from {image_path}")
+                continue
+            self.patient_data = patient_data
+            confirmed, edited_data = self.review_and_confirm(patient_data)
+            if not confirmed:
+                self.log("Data entry cancelled or not confirmed. Skipping this entry.")
+                continue
+            # enter_data is now called from review_and_confirm
+            try:
+                os.remove(image_path)
+                self.log(f"Deleted {image_path}")
+            except Exception as e:
+                self.show_error(f"Could not delete {image_path}: {e}")
+        #self.show_info("Batch processing complete!")
+
+    def review_and_confirm(self, patient_data):
+        if self.cli_mode:
+            # Terminal mode: print and allow manual edit
+            fields = ["Name", "Date of Birth", "MRN Number", "Sex", "Primary Phone Number", "Address", "ZIP"]
+            edited = list(patient_data)
+            for i, (f, v) in enumerate(zip(fields, patient_data)):
+                print(f"{f}: {v}")
+                resp = input(f"Edit {f}? (leave blank to keep): ").strip()
+                if resp:
+                    edited[i] = resp
+            confirm = input("Is the extracted information correct? (yes/no): ").strip().lower() in ["yes", "y"]
+            if not confirm:
+                print("Data entry cancelled.")
+                return False, edited
+            ready = input("Are you ready to paste the information? (yes/no): ").strip().lower() in ["yes", "y"]
+            if not ready:
+                print("Data entry cancelled.")
+                return False, edited
+            return True, edited
+        else:
+            # GUI mode: show editable fields in a modal dialog
+            result = {'confirmed': False, 'edited': list(patient_data)}
+            dialog = tk.Toplevel(self.master)
+            dialog.title("Review Extracted Data")
+            fields = ["Name", "Date of Birth", "MRN Number", "Sex", "Primary Phone Number", "Address", "ZIP"]
+            entries = []
+            for i, (f, v) in enumerate(zip(fields, patient_data)):
+                tk.Label(dialog, text=f).grid(row=i, column=0, sticky='e')
+                entry = tk.Entry(dialog, width=40)
+                entry.insert(0, v)
+                entry.grid(row=i, column=1)
+                entries.append(entry)
+            # Add warning label
+            warning = tk.Label(dialog, text="Please ensure the target application is active and ready to receive input. You have 5 seconds to switch to the target application before auto-entry begins.", fg="red", wraplength=350, justify="left")
+            warning.grid(row=len(fields), column=0, columnspan=2, pady=(10,0))
+            def on_confirm():
+                result['confirmed'] = True
+                result['edited'] = [e.get() for e in entries]
+                dialog.destroy()
+                # Start auto-entry after closing dialog
+                self.master.after(100, lambda: self.master.after(5000, lambda: enter_data(self.coordinates, result['edited'])))
+            def on_cancel():
+                result['confirmed'] = False
+                dialog.destroy()
+            btn_frame = tk.Frame(dialog)
+            btn_frame.grid(row=len(fields)+1, column=0, columnspan=2, pady=10)
+            confirm_btn = tk.Button(btn_frame, text="Confirm and Continue", command=on_confirm)
+            confirm_btn.pack(side='left', padx=5)
+            cancel_btn = tk.Button(btn_frame, text="Cancel Entry", command=on_cancel)
+            cancel_btn.pack(side='left', padx=5)
+            dialog.transient(self.master)
+            dialog.grab_set()
+            self.master.wait_window(dialog)
+            if not result['confirmed']:
+                return False, patient_data
+            return True, result['edited']
+
+    def toggle_hotkey_mode(self):
+        self.hotkey_enabled = not self.hotkey_enabled
+        if self.hotkey_enabled:
+            self.toggle_btn.config(text="Hotkey Mode: ON")
+        else:
+            self.toggle_btn.config(text="Hotkey Mode: OFF")
+
+# CLI entry point
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cli', action='store_true', help='Run in terminal mode (no GUI)')
+    args = parser.parse_args()
+    if args.cli:
+        # Terminal mode: run as before
+        # ... existing main() logic here ...
+        pass
+    else:
+        root = tk.Tk()
+        app = BatchChoppedApp(root, cli_mode=False)
+        root.mainloop()

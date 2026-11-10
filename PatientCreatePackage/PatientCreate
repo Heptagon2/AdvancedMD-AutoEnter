@@ -1,0 +1,1161 @@
+import sys
+import ctypes
+
+# Set DPI awareness FIRST, before any other imports
+# This must be done before tkinter or any GUI libraries are imported
+try:
+    # Try to set per-monitor DPI awareness (Windows 8.1+)
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    print("DPI Awareness: Per-Monitor DPI Aware (v2)")
+except Exception:
+    try:
+        # Fallback to system DPI awareness (older Windows)
+        ctypes.windll.user32.SetProcessDPIAware()
+        print("DPI Awareness: System DPI Aware")
+    except Exception:
+        print("DPI Awareness: Could not set (may be non-Windows)")
+
+from google import generativeai as genai
+import pyautogui
+import pyperclip
+import time
+import keyboard
+import threading
+import json
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import re
+from pdf2image import convert_from_path
+import argparse
+import mss
+from dotenv import load_dotenv
+import cv2
+import numpy as np
+import random
+
+Batch_file = False
+Calibrating = False
+# Global flag for slow mode tabbing; controlled by GUI checkbox
+SLOWMODE_ENABLED = False
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller .exe """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+def get_data_path(filename):
+    """ Get path for data files that should persist between app runs """
+    # Use the directory where the exe is located, or current directory for dev
+    try:
+        # If running as exe, use the exe's directory
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.abspath(".")
+    except Exception:
+        # If running as script, use the current directory
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, filename)
+
+# Load environment variables from .env file
+# First try to load from bundled resources (for .exe)
+load_dotenv(dotenv_path=resource_path(".env"))
+# Then try to load from external .env next to exe (overrides bundled if present)
+load_dotenv(dotenv_path=get_data_path(".env"), override=False)
+
+def choose_gemini_api_key():
+    """Randomly choose one of the configured Gemini API keys.
+
+    Considers environment variables GEMINI_API_KEY, GEMINI_API_KEY2, GEMINI_API_KEY3.
+    Each configured key has an equal chance of being selected. If no keys are set,
+    returns (None, None).
+    """
+    key_names = ["GEMINI_API_KEY", "GEMINI_API_KEY2", "GEMINI_API_KEY3"]
+    available = []
+    for name in key_names:
+        value = os.getenv(name)
+        if value:
+            available.append((name, value))
+
+    if not available:
+        return None, None
+
+    return random.choice(available)
+
+def convert_pdf_to_images(pdf_path, output_folder="output_images"):
+    os.makedirs(output_folder, exist_ok=True)
+    images = convert_from_path(pdf_path, dpi=300)
+    
+    image_path = []
+    for i, img in enumerate(images):
+        img_pathSingle = os.path.join(output_folder, f"page_{i+1}.png")
+        img.save(img_pathSingle, "PNG")
+        image_path.append(img_pathSingle)
+    
+    return image_path
+
+def load_coordinates():
+    """Load saved coordinates from file"""
+    try:
+        with open(get_data_path("coordinates.json"), "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        tk.messagebox.showerror("Error", "coordinates.json is corrupted. Please delete it and recalibrate.")
+        return None
+
+def save_coordinates(coordinates):
+    """Save coordinates to file"""
+    with open(get_data_path("coordinates.json"), "w") as f:
+        json.dump(coordinates, f, indent=2)
+
+def select_input():
+    """Open file dialog to select input"""
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    
+    file_path = filedialog.askopenfilename(
+        title="Select Screenshot Image/Batch PDF",
+        filetypes=[
+            ("Input files", "*.png *.jpg *.jpeg *.bmp *.gif *.pdf"),
+            ("PNG files", "*.png"),
+            ("JPEG files", "*.jpg *.jpeg"),
+            ("PDF Files", "*.pdf"),
+            ("All files", "*.*"),
+        ]
+    )
+    
+    if not file_path:
+        tk.messagebox.showinfo("Info", "No file selected.")
+        return []
+    
+    if os.path.splitext(file_path)[1].lower() == '.pdf':
+        return convert_pdf_to_images(file_path, output_folder="output_images")
+    else:
+        return [file_path]
+
+def calibrate_positions(gui_status_callback=None):
+    """Calibrate cursor positions for all form fields"""
+    print("Calibrating cursor positions...")
+    print("For each field, hover your mouse over the text box and press ` to save the position")
+    print("You can press Ctrl+C at any time to cancel calibration")
+    
+    coordinates = {}
+    fields = [
+        ("Patient White Space", "whitespacexy")
+    ]
+    
+    for field_name, coord_key in fields:
+        if gui_status_callback:
+            gui_status_callback(f"Calibrating: {field_name}")
+        print(f"\nHover over {field_name} text box and press ` to save position")
+        print("Press Ctrl+C to cancel")
+        
+        stop_event = threading.Event()
+        
+        def listen_for_kill_key():
+            try:
+                keyboard.wait('~')
+                stop_event.set()
+            except KeyboardInterrupt:
+                print("\nCalibration cancelled.")
+                sys.exit(1)
+        
+        # Start the kill-key listener in the background
+        threading.Thread(target=listen_for_kill_key, daemon=True).start()
+        
+        # Main loop: print mouse position until kill key is pressed
+        while not stop_event.is_set():
+            try:
+                print(f"\rCurrent position: {pyautogui.position()}", end="", flush=True)
+                time.sleep(0.1)
+            except KeyboardInterrupt:
+                print("\nCalibration cancelled.")
+                sys.exit(1)
+        
+        position = pyautogui.position()
+        coordinates[coord_key] = {"x": position.x, "y": position.y}
+        print(f"\n{field_name} position saved: {position}")
+        stop_event.clear()
+        time.sleep(0.5)
+    
+    if gui_status_callback:
+        gui_status_callback("")
+    return coordinates
+
+def screenshot_active_monitor():
+    """Capture screenshot of the monitor where the mouse is currently located.
+
+    Uses Win32 APIs to get accurate per-monitor coordinates (DPI-aware), then
+    captures that exact rectangle using mss.grab(bbox).
+    """
+    # Get mouse position
+    mouse_x, mouse_y = pyautogui.position()
+    print(f"Mouse position: ({mouse_x}, {mouse_y})")
+
+    # Get all monitor info using ctypes for accurate dimensions
+    user32 = ctypes.windll.user32
+
+    def get_monitors_info():
+        """Get accurate monitor information using Windows API"""
+        monitors = []
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.POINTER(RECT), ctypes.c_double)
+        def callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
+            info = lprcMonitor.contents
+            monitors.append(
+                {
+                    "left": info.left,
+                    "top": info.top,
+                    "width": info.right - info.left,
+                    "height": info.bottom - info.top,
+                }
+            )
+            return 1
+
+        user32.EnumDisplayMonitors(0, 0, callback, 0)
+        return monitors
+
+    monitors = get_monitors_info()
+    print(f"Total monitors detected: {len(monitors)}")
+
+    # Find which monitor contains the mouse
+    monitor_index = None
+    target_monitor = None
+
+    for i, monitor in enumerate(monitors, start=1):
+        print(
+            f"  Monitor {i}: left={monitor['left']}, top={monitor['top']}, "
+            f"width={monitor['width']}, height={monitor['height']}"
+        )
+
+        x1 = monitor["left"]
+        y1 = monitor["top"]
+        x2 = x1 + monitor["width"]
+        y2 = y1 + monitor["height"]
+
+        print(f"  Checking Monitor {i}: x=[{x1}, {x2}), y=[{y1}, {y2})")
+
+        if x1 <= mouse_x < x2 and y1 <= mouse_y < y2:
+            monitor_index = i
+            target_monitor = monitor
+            print(f"  -> Mouse is on Monitor {i}")
+            break
+
+    # Fallback to first monitor if mouse position doesn't match any monitor
+    if target_monitor is None:
+        print("Warning: Mouse position doesn't match any monitor bounds. Using first monitor.")
+        if monitors:
+            target_monitor = monitors[0]
+            monitor_index = 1
+        else:
+            # No monitors reported; bail out gracefully
+            print("No monitors reported by Win32 API; cannot capture screenshot.")
+            return
+
+    print(f"Capturing Monitor {monitor_index}: {target_monitor}")
+
+    # Use mss to capture the specific region. We pass an explicit bbox so we
+    # don't rely on mss's own monitor list (which can be DPI-scaled).
+    bbox = (
+        target_monitor["left"],
+        target_monitor["top"],
+        target_monitor["left"] + target_monitor["width"],
+        target_monitor["top"] + target_monitor["height"],
+    )
+
+    with mss.mss() as sct:
+        sct_img = sct.grab(bbox)
+
+    output_path = "monitor_under_mouse.png"
+    mss.tools.to_png(sct_img.rgb, sct_img.size, output=output_path)
+
+    print(f"Screenshot saved: {output_path}")
+    print(f"  Captured size: {sct_img.width}x{sct_img.height}")
+    print(f"  Expected size: {target_monitor['width']}x{target_monitor['height']}")
+    print(f"  Position: ({target_monitor['left']}, {target_monitor['top']})")
+
+def identify_city_option_from_image(image_path, city_name, zip_code):
+    """Use Gemini to identify which city option index matches the given city_name and ZIP code.
+
+    Returns: index_str - integer index (1-based) as a string, e.g. "1", "2", "3"; "0" if no match.
+    """
+    try:
+        key_name, api_key = choose_gemini_api_key()
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
+        genai.configure(api_key=api_key)
+
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
+
+        prompt = f"""You are looking at a screenshot that contains a dropdown list of cities.
+The city we want to select in the dropdown is: "{city_name}" and the ZIP code must be: "{zip_code}".
+
+Your job is to choose which VISIBLE DROPDOWN OPTION the user should select.
+
+HOW TO NUMBER OPTIONS (SelectedIndex):
+- Look ONLY at the visible options in the dropdown list. The first option in the dropdown list is a darker grey than the rest.
+- Number them from TOP to BOTTOM starting at 1.
+  - The top visible option has SelectedIndex = 1.
+  - The second visible option has SelectedIndex = 2.
+  - The third visible option has SelectedIndex = 3, and so on.
+
+MATCHING RULES (CITY + ZIP MUST MATCH):
+- Only consider an option a valid match if BOTH are true:
+  1) Its CITY NAME matches "{city_name}" (ignore case and minor punctuation), AND
+  2) Its ZIP CODE matches "{zip_code}" (ignore spaces and minor formatting).
+- If exactly one option clearly corresponds to both the requested city and ZIP, that option's position is the SelectedIndex.
+- If there is NO good match, or you cannot see any city list or ZIP codes, the SelectedIndex MUST be 0.
+
+Output format (VERY IMPORTANT):
+- Output EXACTLY ONE line containing only the SelectedIndex as an integer (0, 1, 2, 3, ...).
+- Do NOT output any other text, labels, explanations, or punctuation.
+"""
+
+        response = model.generate_content([
+            {
+                "role": "user",
+                "parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": image_bytes}},
+                    {"text": prompt},
+                ],
+            }
+        ])
+
+        text = response.text.strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+        index_text = "0"
+
+        if lines:
+            # Basic sanitation: keep only leading integer-like content on first line
+            match = re.match(r"^(-?\d+)", lines[0])
+            if match:
+                index_text = match.group(1)
+
+        return index_text
+    except Exception as e:
+        print(f"Error identifying city option from image: {e}")
+        return "0"
+
+def check_for_duplicate_patient(image_path):
+    """Check if a duplicate patient warning banner is present in the screenshot.
+    
+    Uses OpenCV template matching to compare the full screenshot
+    against FlagTemplate.png.
+
+    Returns: bool - True if duplicate warning detected, False otherwise.
+    """
+    try:
+        # Load the screenshot (use full image for matching)
+        screenshot = cv2.imread(image_path)
+        if screenshot is None:
+            print(f"Error: Could not load screenshot from {image_path}")
+            return False
+
+        height, width = screenshot.shape[:2]
+
+        # Load the flag template
+        template_path = resource_path("FlagTemplate.png")
+        template = cv2.imread(template_path)
+        if template is None:
+            print(f"Error: Could not load FlagTemplate.png from {template_path}")
+            return False
+        
+        # Get template dimensions
+        template_height, template_width = template.shape[:2]
+        
+        # Check if template is larger than the search region
+        if template_height > height or template_width > width:
+            print(f"Warning: Template ({template_width}x{template_height}) is larger than search region ({width}x{height})")
+            return False
+        
+        # Perform template matching
+        result = cv2.matchTemplate(screenshot, template, cv2.TM_CCOEFF_NORMED)
+        
+        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        
+        # Set confidence threshold (adjust as needed)
+        confidence_threshold = 0.4
+        
+        print(f"Duplicate flag template match confidence: {max_val:.3f} (threshold: {confidence_threshold})")
+        
+        # Return True if confidence exceeds threshold
+        is_duplicate = max_val >= confidence_threshold
+        
+        return is_duplicate
+    except Exception as e:
+        print(f"Error checking for duplicate patient: {e}")
+        return False
+
+def extract_patient_info(image_path):
+    """Extract patient information from screenshot using Gemini AI"""
+    try:
+        # Select one of the configured Gemini API keys at random
+        key_name, api_key = choose_gemini_api_key()
+        if not api_key:
+            try:
+                tk.messagebox.showerror(
+                    "Error",
+                    "GEMINI_API_KEY not found.\n\n"
+                    "Make sure a .env file exists next to the executable and contains:\n"
+                    "GEMINI_API_KEY=your_api_key_here",
+                )
+            except Exception:
+                pass
+            raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
+
+        genai.configure(api_key=api_key)
+        
+        # Load image from file
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        
+        # Select model
+        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        
+        # Generate response
+        response = model.generate_content([
+            {
+                "role": "user",
+                "parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": image_bytes}},
+                    {"text": """From the image provided, extract ONLY the following patient/member information, in this exact order, one item per line:
+1) Last_Name (family name only)
+2) First_Name (given name only)
+3) Middle_Name (middle name only; if none is present, output just a single '~')
+4) Date of birth (in the form MM/DD/YYYY)
+5) MRN number
+6) Sex
+7) Primary phone number
+8) COMPLETE primary street address (with BOTH house number AND street name; do not include city, state, or ZIP)
+9) SECONDARY address line such as apartment, suite, unit, building, floor, etc. (if none is present, output just a single '~')
+10) City (do not include state)
+11) ZIP code (do not include extension, or state)
+
+Rules:
+- Output exactly ELEVEN lines and nothing else.
+- Do not put 1), 2), etc or any other header in your response. It should only be the requested response.
+- The name will either come in two formats: "Last, First Middle" or "First Middle Last". Note that the presence or absence of a comma will determine the format.
+- Do NOT include any labels, bullet points, or extra words.
+- DO NOT give any information on the provider.
+- If you cannot find enough information for a field (other than MRN, secondary adress, or Middle_Name), output the text 'could not find' for that specific line.
+
+MRN RULES (EXTREMELY IMPORTANT):
+- The MRN number will ONLY be present if it is EXPLICITLY labeled as "MRN" in the image.
+- Do NOT use any number labeled as "ID", "Member ID", "Insurance Number", "Policy Number", "Account Number", or any other identifier.
+- If there is no field explicitly labeled "MRN", output only a single '~' for the MRN line.
+- If you cannot find an MRN number that is explicitly labeled "MRN", do NOT write 'could not find'; instead output only a single '~' for the MRN line.
+- If you cannot find a Middle_Name, or if there is no secondary address line, output only a single '~' for that line.
+You must always output exactly eleven lines in this order, no matter what the values are."""}
+                ]
+            }
+        ])
+        
+        return response.text
+    except Exception as e:
+        print(f"Error extracting information from image: {e}")
+        return None
+
+def unpack_response(response):
+    """Parse the AI response into individual fields and clean address/ZIP.
+
+    Returns a dict with at least these keys:
+    LastName, FirstName, MiddleName, PatientName, DateOfBirth,
+    MRNNumber, Sex, PrimaryPhoneNumber, Address, SecondaryAddress, City, ZipCode.
+    """
+    try:
+        lines = [line.strip() for line in response.strip().split('\n') if line.strip()]
+
+        data = {
+            "LastName": "",
+            "FirstName": "",
+            "MiddleName": "",
+            "PatientName": "",
+            "DateOfBirth": "",
+            "MRNNumber": "",
+            "Sex": "",
+            "PrimaryPhoneNumber": "",
+            "Address": "",
+            "SecondaryAddress": "",
+            "City": "",
+            "ZipCode": "",
+        }
+
+        if len(lines) < 11:
+            print("Error: AI response doesn't contain enough information.")
+            print("You will have to manually change the information.")
+
+            # Field names and labels to prompt the user (combined name)
+            field_names = ["PatientName", "DateOfBirth", "MRNNumber", "Sex", "PrimaryPhoneNumber", "Address", "SecondaryAddress", "City", "ZipCode"]
+            prompts = ["Patient name", "Date of birth", "MRN Number", "Sex", "Primary phone number", "Primary address", "Secondary address", "City", "ZIP Code"]
+
+            for i, (field, prompt) in enumerate(zip(field_names, prompts)):
+                if i < len(lines):
+                    value = lines[i]
+                else:
+                    value = "MISSING"
+
+                print(f"{prompt} is: {value}")
+                confirmation = input("Press Enter to confirm, or type 'no' to change: ").strip().lower()
+                if confirmation == "no":
+                    corrected = input(f"Type in correction for {prompt}: ").strip()
+                else:
+                    corrected = value
+
+                # For ZipCode, trim to 5 digits
+                if field == "ZipCode":
+                    corrected = corrected[:5]
+
+                data[field] = corrected
+
+            # Derive Last/First/Middle from combined PatientName if possible
+            name = data.get("PatientName", "").strip()
+            last_name = ""
+            first_name = ""
+            middle_name = ""
+            if name:
+                if "," in name:
+                    parts = [p.strip() for p in name.split(",", 1)]
+                    last_name = parts[0]
+                    rest = parts[1] if len(parts) > 1 else ""
+                    rest_parts = rest.split()
+                    if rest_parts:
+                        first_name = rest_parts[0]
+                        if len(rest_parts) > 1:
+                            middle_name = " ".join(rest_parts[1:])
+                else:
+                    # Fallback: split by spaces assuming Last First Middle
+                    parts = name.split()
+                    if len(parts) == 1:
+                        last_name = parts[0]
+                    elif len(parts) == 2:
+                        last_name, first_name = parts
+                    elif len(parts) >= 3:
+                        last_name = parts[0]
+                        first_name = parts[1]
+                        middle_name = " ".join(parts[2:])
+
+            data["LastName"] = last_name
+            data["FirstName"] = first_name
+            data["MiddleName"] = middle_name
+
+        if len(lines) >= 11:
+            # First three lines are Last_Name, First_Name, Middle_Name (or '~' if none)
+            last_name = lines[0]
+            first_name = lines[1]
+            middle_name = lines[2]
+
+            if middle_name == "~" or middle_name.lower() == "could not find":
+                patient_name = f"{last_name}, {first_name}"
+                middle_name = ""
+            else:
+                patient_name = f"{last_name}, {first_name} {middle_name}"
+
+            date_of_birth = lines[3]
+            mrn_number = lines[4]
+            sex = lines[5]
+            primary_phone = lines[6]
+            address = lines[7]
+            secondary_address = lines[8]
+            city = lines[9]
+            zip_code = lines[10][:5]
+
+            data.update({
+                "LastName": last_name,
+                "FirstName": first_name,
+                "MiddleName": middle_name,
+                "PatientName": patient_name,
+                "DateOfBirth": date_of_birth,
+                "MRNNumber": mrn_number,
+                "Sex": sex,
+                "PrimaryPhoneNumber": primary_phone,
+                "Address": address,
+                "SecondaryAddress": secondary_address,
+                "City": city,
+                "ZipCode": zip_code,
+            })
+
+        return data
+
+    except Exception as e:
+        print(f"Error parsing AI response: {e}")
+        return None
+
+def pyauto_tab(tabamount):
+    """Press Tab key tabamount times.
+
+    If SLOWMODE_ENABLED is True, wait 0.05s between each Tab to slow down
+    navigation for sensitive UIs.
+    """
+    global SLOWMODE_ENABLED
+    i = 1
+    while i <= tabamount:
+        pyautogui.press('tab')
+        if SLOWMODE_ENABLED:
+            time.sleep(0.05)
+        i += 1
+
+def pyauto_enter_data(data):
+    global SLOWMODE_ENABLED
+    try:
+        if SLOWMODE_ENABLED:
+            pyautogui.write(str(data), interval=0.02)
+            time.sleep(0.5)
+        else:
+            pyautogui.write(str(data), interval=0.01)
+            time.sleep(0.3)
+    except Exception as e:
+        print(f"Error entering Patient Data: {e}")
+
+def enter_data(coordinates, patient_data):
+    """Enter patient data into form fields.
+
+    patient_data is a dict returned by unpack_response.
+    """
+    global SLOWMODE_ENABLED
+
+    # Track whether city selection succeeded; if it fails (index 0),
+    # we will stop just before the duplicate check / save step.
+    city_selection_ok = True
+
+    PatientLastName = patient_data.get("LastName", "")
+
+    PatientFirstName = patient_data.get("FirstName", "")
+    PatientMiddleName = patient_data.get("MiddleName", "")
+    DateOfBirth = patient_data.get("DateOfBirth", "")
+    MRNNumber = patient_data.get("MRNNumber", "")
+    Sex = patient_data.get("Sex", "")
+    PrimaryPhoneNumber = patient_data.get("PrimaryPhoneNumber", "")
+    Address = patient_data.get("Address", "")
+    SecondaryAddress = patient_data.get("SecondaryAddress", "")
+    City = patient_data.get("City", "")
+    ZipCode = patient_data.get("ZipCode", "")
+
+    print("\nEntering data into form...")
+    print("Please ensure the target application is active and ready to receive input.")
+    print("You have 3 seconds to switch to the target application...")
+    #time.sleep(3)
+    
+    # Enter Patient Name
+    try:
+        coord = coordinates["whitespacexy"]
+        x, y = coord["x"], coord["y"]
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        pyautogui.click()
+    except Exception as e:
+        print(f"Error with White Space Coordinates: {e}")
+    
+    # Enter MRN Number
+    pyauto_tab(5)
+    if MRNNumber=="~":
+        print(f"Skipping MRN Number")
+    else:
+        print(f"Entering MRN Number: {MRNNumber}")
+        pyauto_enter_data(MRNNumber)
+
+   #Enter Last Name
+    pyauto_tab(2)
+    print(f"Entering Last Name: {PatientLastName}")
+    pyauto_enter_data(PatientLastName)
+
+    #Enter First Name
+    pyauto_tab(1)
+    print(f"Entering First Name: {PatientFirstName}")
+    pyauto_enter_data(PatientFirstName)
+
+    #Enter Middle Name
+    pyauto_tab(1)
+    if PatientMiddleName=="~":
+        print(f"Skipping Middle Name")
+    else:
+        print(f"Entering Last Name: {PatientMiddleName}")
+        pyauto_enter_data(PatientMiddleName)
+
+    #Enter DOB
+    pyauto_tab(7)
+    print(f"Entering DOB: {DateOfBirth}")
+    pyauto_enter_data(DateOfBirth)
+    
+    #Enter Street Address
+    pyauto_tab(6)
+    print(f"Entering Street Address: {Address}")
+    pyauto_enter_data(Address)
+
+    #Enter Secondary Address
+    pyauto_tab(1)
+    if SecondaryAddress == "~":
+        print(f"Skipping Secondary Address")
+    else:
+        print(f"Entering Secondary Address: {SecondaryAddress}")
+        pyauto_enter_data(SecondaryAddress)
+
+    # Enter ZIP Code (with tab press and extension handling)
+    pyauto_tab(1)
+    try:
+        print(f"Entering ZIP Code: {ZipCode}")
+        if '-' in ZipCode:
+            zip_main = ZipCode.split('-')[0]
+        else:
+            zip_main = ZipCode
+        # Type ZIP very slowly to avoid missed digits
+        pyautogui.write(str(zip_main), interval=0.1)
+        time.sleep(2)
+        if SLOWMODE_ENABLED:
+            time.sleep(1)
+        # Capture the current screen and ask Gemini which city option index matches the City and ZIP value
+        try:
+            screenshot_active_monitor()
+            city_dropdown_image = "monitor_under_mouse.png"
+            city_index = identify_city_option_from_image(city_dropdown_image, City, zip_main)
+            print(f"Identified city dropdown index for '{City}': {city_index}")
+
+            # If Gemini returned a valid positive integer index, move selection and confirm
+            try:
+                idx = int(city_index)
+                if idx <= 0:
+                    # Fallback: no reliable city match; skip auto-selection and
+                    # prevent auto-save later.
+                    print("City identification returned 0 (fallback); skipping city auto-selection and later auto-save.")
+                    city_selection_ok = False
+                else:
+                    # Guardrail: avoid moving too far even if Gemini gives a bad index.
+                    # Treat very large indices as suspicious and skip auto-save.
+                    max_allowed_index = 10
+                    if idx > max_allowed_index:
+                        print(f"City index {idx} is greater than max_allowed_index {max_allowed_index}; treating as failure and skipping auto-save.")
+                        city_selection_ok = False
+                    else:
+                        moves = max(0, idx - 1)
+                        print(f"Moving down {moves} time(s) to reach city index {idx}.")
+                        for _ in range(moves):
+                            pyautogui.press('down')
+                            time.sleep(0.1)
+            except ValueError:
+                print(f"City index '{city_index}' is not a valid integer; skipping auto-selection.")
+        except Exception as e:
+            print(f"Error identifying city selection from dropdown: {e}")
+        pyautogui.press('tab')
+    except Exception as e:
+        print(f"Error entering ZIP Code: {e}")
+    
+    time.sleep(0.5)
+
+    #Enter Phone Number
+    pyauto_tab(3)
+    print(f"Entering Phone Number: {PrimaryPhoneNumber}")
+    pyauto_enter_data(PrimaryPhoneNumber)
+
+    #Enter Sex
+    pyauto_tab(7)
+    time.sleep(0.5)
+    print(f"Entering Sex: {Sex}")
+    pyauto_enter_data(Sex)
+
+    #press save
+    pyauto_tab(23)
+
+    # If city selection failed (index 0), stop here before duplicate check/save
+    if not city_selection_ok:
+        print("City identification fallback detected; stopping before duplicate check and auto-save.")
+        return
+    
+    # Check for duplicate patient warning before saving
+    try:
+        screenshot_active_monitor()
+        duplicate_check_image = "monitor_under_mouse.png"
+        is_duplicate = check_for_duplicate_patient(duplicate_check_image)
+        print(f"Duplicate patient check: {is_duplicate}")
+        
+        if is_duplicate:
+            print("Duplicate detected")
+            try:
+                tk.messagebox.showwarning("Possible Patient Duplicate Found", "An orange 'Possible Patient Duplicate Found' banner was detected. Please review the record before saving.")
+            except Exception as e:
+                print(f"Error showing duplicate warning messagebox: {e}")
+        else:
+            pyautogui.press('enter')
+    except Exception as e:
+        print(f"Error during duplicate check: {e}")
+        # If check fails, don't auto-save to be safe
+        print("Skipping auto-save due to error.")
+    
+    print("Data entry completed!")
+
+class PatientCreateApp:
+    def __init__(self, master=None, cli_mode=False):
+        self.cli_mode = cli_mode
+        self.master = master
+        self.hotkey_enabled = False
+        self.calibration_step_event = threading.Event()
+        self.calibrating = False
+        if not cli_mode:
+            self.master.title("PatientCreate - AutoEnter V3")
+            self.status_var = tk.StringVar()
+            self.status_label = tk.Label(master, textvariable=self.status_var)
+            self.status_label.pack()
+            self.main_frame = tk.Frame(master)
+            self.main_frame.pack()
+            # Slow mode checkbox state for tabbing speed
+            self.slowmode_var = tk.BooleanVar(value=False)
+            self.build_gui()
+            self.review_frame = None
+            self.quit_btn = tk.Button(master, text="Quit", command=self.quit_app)
+            self.quit_btn.pack(pady=5)
+            self.master.protocol("WM_DELETE_WINDOW", self.quit_app)
+            keyboard.add_hotkey('`', self.global_hotkey_handler)
+        self.coordinates = None
+        self.image_paths = []
+        self.current_idx = 0
+        self.patient_data = None
+        self.review_entries = []
+        if not self.cli_mode:
+            self.coordinates = load_coordinates()
+            if not self.coordinates:
+                self.show_info("No saved coordinates found. Please calibrate before continuing.")
+
+    def log(self, msg):
+        if self.cli_mode:
+            print(msg)
+        else:
+            self.status_var.set(msg)
+            self.master.update_idletasks()
+
+    def ask_input(self, prompt):
+        if self.cli_mode:
+            return input(prompt)
+        else:
+            # Simple input dialog
+            from tkinter.simpledialog import askstring
+            return askstring("Input", prompt)
+
+    def ask_yesno(self, prompt):
+        if self.cli_mode:
+            return input(f"{prompt} (yes/no): ").strip().lower() in ["yes", "y"]
+        else:
+            return tk.messagebox.askyesno("Confirm", prompt)
+
+    def show_error(self, msg):
+        if self.cli_mode:
+            print(f"ERROR: {msg}")
+        else:
+            tk.messagebox.showerror("Error", msg)
+
+    def show_info(self, msg):
+        if self.cli_mode:
+            print(msg)
+        else:
+            tk.messagebox.showinfo("Info", msg)
+
+    def build_gui(self):
+        self.select_btn = tk.Button(self.main_frame, text="Select Input File", command=self.select_input_gui)
+        self.select_btn.pack(padx=100,pady=5)
+        self.calib_btn = tk.Button(self.main_frame, text="Calibrate Positions", command=self.calibrate_positions_gui)
+        self.calib_btn.pack(pady=5)
+        # Toggle hotkey/manual mode
+        self.toggle_btn = tk.Button(self.main_frame, text="Hotkey Mode: OFF", command=self.toggle_hotkey_mode)
+        self.toggle_btn.pack(pady=5)
+
+        # Slow mode checkbox for pyauto_tab
+        def on_slowmode_toggle():
+            global SLOWMODE_ENABLED
+            SLOWMODE_ENABLED = bool(self.slowmode_var.get())
+
+        self.slowmode_check = tk.Checkbutton(
+            self.main_frame,
+            text="Slow mode (slow tabs)",
+            variable=self.slowmode_var,
+            command=on_slowmode_toggle,
+        )
+        self.slowmode_check.pack(pady=5)
+
+    def select_input_gui(self):
+        self.image_paths = select_input()
+        if self.image_paths:
+            self.log(f"Selected {len(self.image_paths)} images.")
+            self.process_images(self.image_paths)
+
+    def calibrate_positions_gui(self):
+        self.calibrating = True
+        try:
+            # Show example image of patient white space during calibration
+            if hasattr(self, "whitespace_example_window") and self.whitespace_example_window is not None:
+                try:
+                    self.whitespace_example_window.destroy()
+                except Exception:
+                    pass
+            self.whitespace_example_window = tk.Toplevel(self.master)
+            self.whitespace_example_window.title("Example of Patient White Space")
+            self.whitespace_example_image = tk.PhotoImage(file=resource_path("ExampleOfWhiteSpace.png"))
+            lbl = tk.Label(self.whitespace_example_window, image=self.whitespace_example_image)
+            lbl.pack()
+            instr = (
+                "Hover your cursor over the area defined by the red box in the application, "
+                "and press the ' ~ ' button to save the location. If you move the application "
+                "after calibrating, you will have to calibrate again."
+            )
+            instr_label = tk.Label(self.whitespace_example_window, text=instr, wraplength=400, justify="left", font=("TkDefaultFont", 11, "bold"))
+            instr_label.pack(pady=5)
+        except Exception as e:
+            print(f"Error showing example white space image: {e}")
+        def status_callback(msg):
+            self.status_var.set(msg)
+            self.master.update_idletasks()
+        def run_calibration():
+            coords = self.calibrate_positions(gui_status_callback=status_callback)
+            def finish_calibration():
+                self.coordinates = coords
+                save_coordinates(self.coordinates)
+                self.log("Calibration complete.")
+                self.calibrating = False
+            self.master.after(0, finish_calibration)
+        threading.Thread(target=run_calibration, daemon=True).start()
+
+    def calibrate_positions(self, gui_status_callback=None):
+        print("Calibrating cursor positions...")
+        print("For each field, hover your mouse over the text box and press ` to save the position")
+        print("You can press Ctrl+C at any time to cancel calibration")
+        coordinates = {}
+        fields = [
+            ("Patient White Space", "whitespacexy"),
+        ]
+        for field_name, coord_key in fields:
+            if gui_status_callback:
+                gui_status_callback(f"Calibrating: {field_name}")
+            print(f"\nHover over {field_name} text box and press ` to save position")
+            print("Press Ctrl+C to cancel")
+            self.calibration_step_event.clear()
+            while True:
+                try:
+                    if self.calibration_step_event.wait(timeout=0.1):
+                        break
+                except KeyboardInterrupt:
+                    print("\nCalibration cancelled.")
+                    sys.exit(1)
+                print(f"\rCurrent position: {pyautogui.position()}", end="", flush=True)
+            position = pyautogui.position()
+            coordinates[coord_key] = {"x": position.x, "y": position.y}
+            print(f"\n{field_name} position saved: {position}")
+            time.sleep(0.5)
+        if gui_status_callback:
+            gui_status_callback("")
+        return coordinates
+
+    def quit_app(self):
+        if self.cli_mode:
+            exit(0)
+        else:
+            self.master.destroy()
+
+    def global_hotkey_handler(self):
+        if self.calibrating:
+            self.calibration_step_event.set()
+        elif self.hotkey_enabled:
+            self.take_and_process_screenshot()
+
+    def take_and_process_screenshot(self):
+        screenshot_active_monitor()
+        image_path = "monitor_under_mouse.png"
+        self.process_images([image_path])
+
+    def process_images(self, image_paths):
+        if not self.coordinates:
+            self.coordinates = load_coordinates()
+        if not self.coordinates:
+            self.show_info("No saved coordinates found. Please calibrate before continuing.")
+            self.calibrate_positions_gui()
+            if not self.coordinates:
+                self.show_error("Calibration failed or cancelled. Cannot continue.")
+                return
+        for idx, image_path in enumerate(image_paths):
+            self.log(f"Processing {image_path} ({idx+1}/{len(image_paths)})...")
+            response = extract_patient_info(image_path)
+            if response is None:
+                self.show_error(f"Failed to extract info from {image_path}")
+                continue
+            patient_data = unpack_response(response)
+            if patient_data is None:
+                self.show_error(f"Failed to parse info from {image_path}")
+                continue
+            self.patient_data = patient_data
+            confirmed, edited_data = self.review_and_confirm(patient_data)
+            if not confirmed:
+                self.log("Data entry cancelled or not confirmed. Skipping this entry.")
+                continue
+            # enter_data is now called from review_and_confirm
+            try:
+                os.remove(image_path)
+                self.log(f"Deleted {image_path}")
+            except Exception as e:
+                self.show_error(f"Could not delete {image_path}: {e}")
+        #self.show_info("Batch processing complete!")
+
+    def review_and_confirm(self, patient_data):
+        if self.cli_mode:
+            # Terminal mode: print and allow manual edit (on main combined fields)
+            field_order = [
+                ("PatientName", "Name"),
+                ("DateOfBirth", "Date of Birth"),
+                ("MRNNumber", "MRN Number"),
+                ("Sex", "Sex"),
+                ("PrimaryPhoneNumber", "Primary Phone Number"),
+                ("Address", "Address"),
+                ("SecondaryAddress", "Secondary Address"),
+                ("City", "City"),
+                ("ZipCode", "ZIP"),
+            ]
+            edited = dict(patient_data)
+            for key, label in field_order:
+                current = edited.get(key, "")
+                print(f"{label}: {current}")
+                resp = input(f"Edit {label}? (leave blank to keep): ").strip()
+                if resp:
+                    edited[key] = resp
+
+            # Recompute separated name fields from PatientName
+            name = edited.get("PatientName", "").strip()
+            last_name = edited.get("LastName", "")
+            first_name = edited.get("FirstName", "")
+            middle_name = edited.get("MiddleName", "")
+            if name:
+                if "," in name:
+                    parts = [p.strip() for p in name.split(",", 1)]
+                    last_name = parts[0]
+                    rest = parts[1] if len(parts) > 1 else ""
+                    rest_parts = rest.split()
+                    if rest_parts:
+                        first_name = rest_parts[0]
+                        if len(rest_parts) > 1:
+                            middle_name = " ".join(rest_parts[1:])
+                else:
+                    parts = name.split()
+                    if len(parts) == 1:
+                        last_name = parts[0]
+                    elif len(parts) == 2:
+                        last_name, first_name = parts
+                    elif len(parts) >= 3:
+                        last_name = parts[0]
+                        first_name = parts[1]
+                        middle_name = " ".join(parts[2:])
+
+            edited["LastName"] = last_name
+            edited["FirstName"] = first_name
+            edited["MiddleName"] = middle_name
+
+            confirm = input("Is the extracted information correct? (yes/no): ").strip().lower() in ["yes", "y"]
+            if not confirm:
+                print("Data entry cancelled.")
+                return False, edited
+            ready = input("Are you ready to paste the information? (yes/no): ").strip().lower() in ["yes", "y"]
+            if not ready:
+                print("Data entry cancelled.")
+                return False, edited
+            return True, edited
+
+        else:
+            # GUI mode: show editable fields in a modal dialog with separate name fields
+            result = {'confirmed': False, 'edited': dict(patient_data)}
+            dialog = tk.Toplevel(self.master)
+            dialog.title("Review Extracted Data")
+
+            field_order = [
+                ("LastName", "Last Name"),
+                ("FirstName", "First Name"),
+                ("MiddleName", "Middle Name"),
+                ("DateOfBirth", "Date of Birth"),
+                ("MRNNumber", "MRN Number"),
+                ("Sex", "Sex"),
+                ("PrimaryPhoneNumber", "Primary Phone Number"),
+                ("Address", "Address"),
+                ("SecondaryAddress", "Secondary Address"),
+                ("City", "City"),
+                ("ZipCode", "ZIP"),
+            ]
+
+            entries = []
+            for i, (key, label) in enumerate(field_order):
+                tk.Label(dialog, text=label).grid(row=i, column=0, sticky='e', padx=5, pady=2)
+                entry = tk.Entry(dialog, width=40)
+                entry.insert(0, str(patient_data.get(key, "")))
+                entry.grid(row=i, column=1, padx=5, pady=2)
+                entries.append((key, entry))
+
+            # Add warning label
+            warning = tk.Label(dialog, text="Please ensure the target application is active and ready to receive input. You have 5 seconds to switch to the target application before auto-entry begins.", fg="red", wraplength=350, justify="left")
+
+            warning.grid(row=len(field_order), column=0, columnspan=2, pady=(10,0))
+            def on_confirm():
+                # Update edited dict from entry widgets
+                for key, entry in entries:
+                    result['edited'][key] = entry.get()
+
+                # Reconstruct PatientName from separate name fields
+                last_name = result['edited'].get("LastName", "").strip()
+                first_name = result['edited'].get("FirstName", "").strip()
+                middle_name = result['edited'].get("MiddleName", "").strip()
+                
+                # Build PatientName in "Last, First Middle" format
+                if middle_name and middle_name != "~":
+                    patient_name = f"{last_name}, {first_name} {middle_name}"
+                else:
+                    patient_name = f"{last_name}, {first_name}"
+                
+                result['edited']["PatientName"] = patient_name
+
+                result['confirmed'] = True
+                dialog.destroy()
+                # Start auto-entry after closing dialog
+                self.master.after(100, lambda: self.master.after(5000, lambda: enter_data(self.coordinates, result['edited'])))
+            def on_cancel():
+                result['confirmed'] = False
+                dialog.destroy()
+            btn_frame = tk.Frame(dialog)
+            btn_frame.grid(row=len(field_order)+1, column=0, columnspan=2, pady=10)
+            confirm_btn = tk.Button(btn_frame, text="Confirm and Continue", command=on_confirm)
+            confirm_btn.pack(side='left', padx=5)
+            cancel_btn = tk.Button(btn_frame, text="Cancel Entry", command=on_cancel)
+            cancel_btn.pack(side='left', padx=5)
+            dialog.transient(self.master)
+            dialog.grab_set()
+            self.master.wait_window(dialog)
+            if not result['confirmed']:
+                return False, patient_data
+            return True, result['edited']
+
+    def toggle_hotkey_mode(self):
+        self.hotkey_enabled = not self.hotkey_enabled
+        if self.hotkey_enabled:
+            self.toggle_btn.config(text="Hotkey Mode: ON")
+        else:
+            self.toggle_btn.config(text="Hotkey Mode: OFF")
+
+# CLI entry point
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cli', action='store_true', help='Run in terminal mode (no GUI)')
+    args = parser.parse_args()
+    if args.cli:
+        # Terminal mode: run as before
+        # ... existing main() logic here ...
+        pass
+    else:
+        root = tk.Tk()
+        app = PatientCreateApp(root, cli_mode=False)
+        root.mainloop()

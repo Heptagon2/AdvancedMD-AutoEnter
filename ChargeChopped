@@ -1,0 +1,684 @@
+from google import generativeai as genai
+import pyautogui
+import pyperclip
+import time
+import keyboard
+import threading
+import json
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import sys
+import argparse
+import mss
+from dotenv import load_dotenv
+
+ICDManualMode = False
+Calibrating = False
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller .exe """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+def get_data_path(filename):
+    """ Get path for data files that should persist between app runs """
+    # Use the directory where the exe is located, or current directory for dev
+    try:
+        # If running as exe, use the exe's directory
+        if getattr(sys, 'frozen', False):
+            base_path = os.path.dirname(sys.executable)
+        else:
+            base_path = os.path.abspath(".")
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, filename)
+
+# Load environment variables from .env file
+# First try to load from bundled resources (for .exe)
+load_dotenv(dotenv_path=resource_path(".env"))
+# Then try to load from external .env next to exe (overrides bundled if present)
+load_dotenv(dotenv_path=get_data_path(".env"), override=False)
+
+def load_coordinates():
+    """Load saved coordinates from file"""
+    try:
+        with open(get_data_path("chargeCoordinates.json"), "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError:
+        tk.messagebox.showerror("Error", "chargeCoordinates.json is corrupted. Please delete it and recalibrate.")
+        return None
+
+def save_coordinates(coordinates):
+    """Save coordinates to file"""
+    with open(get_data_path("chargeCoordinates.json"), "w") as f:
+        json.dump(coordinates, f, indent=2)
+
+def select_screenshot():
+    """Open file dialog to select screenshot"""
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    
+    file_path = filedialog.askopenfilename(
+        title="Select Screenshot Image",
+        filetypes=[
+            ("Image files", "*.png *.jpg *.jpeg *.bmp *.gif"),
+            ("PNG files", "*.png"),
+            ("JPEG files", "*.jpg *.jpeg"),
+            ("All files", "*.*")
+        ]
+    )
+    
+    if not file_path:
+        tk.messagebox.showinfo("Info", "No file selected.")
+        return None
+    
+    return file_path
+
+def calibrate_positions(gui_status_callback=None):
+    """Calibrate cursor positions for all form fields"""
+    print("Calibrating cursor positions...")
+    print("For each field, hover your mouse over the text box and press ` to save the position")
+    print("You can press Ctrl+C at any time to cancel calibration")
+    
+    coordinates = {}
+    fields = [
+        ("Patient Name", "namexy"),
+        ("Visit button", "visitxy"),
+        ("Facility button", "facilityxy"),
+        ("Extra Info button", "infoxy"),
+        #("Primary Phone Number", "primaryphonenumberxy"),
+       # ("Address", "addressxy"),
+        #("ZIP Code", "zipcodexy")
+    ]
+    
+    for field_name, coord_key in fields:
+        if gui_status_callback:
+            gui_status_callback(f"Calibrating: {field_name}")
+        print(f"\nHover over {field_name} text box and press ` to save position")
+        print("Press Ctrl+C to cancel")
+        
+        stop_event = threading.Event()
+        
+        def listen_for_kill_key():
+            try:
+                keyboard.wait('~')
+                stop_event.set()
+            except KeyboardInterrupt:
+                print("\nCalibration cancelled.")
+                sys.exit(1)
+        
+        # Start the kill-key listener in the background
+        threading.Thread(target=listen_for_kill_key, daemon=True).start()
+        
+        # Main loop: print mouse position until kill key is pressed
+        while not stop_event.is_set():
+            try:
+                print(f"\rCurrent position: {pyautogui.position()}", end="", flush=True)
+                time.sleep(0.1)
+            except KeyboardInterrupt:
+                print("\nCalibration cancelled.")
+                sys.exit(1)
+        
+        position = pyautogui.position()
+        coordinates[coord_key] = {"x": position.x, "y": position.y}
+        print(f"\n{field_name} position saved: {position}")
+        stop_event.clear()
+        time.sleep(0.5)
+    
+    if gui_status_callback:
+        gui_status_callback("")
+    return coordinates
+
+def get_monitor_under_mouse():
+    """Find the monitor where the mouse is currently located."""
+    mouse_x, mouse_y = pyautogui.position()
+
+    with mss.mss() as sct:
+        for i, monitor in enumerate(sct.monitors[1:], start=1):  # Skip [0], which is all monitors
+            x1 = monitor["left"]
+            y1 = monitor["top"]
+            x2 = x1 + monitor["width"]
+            y2 = y1 + monitor["height"]
+
+            if x1 <= mouse_x < x2 and y1 <= mouse_y < y2:
+                return i  # Return monitor index instead of dict
+
+        # If no monitor found (edge case), return primary monitor index
+        if len(sct.monitors) > 1:
+            return 1
+    
+    return None
+
+def screenshot_active_monitor():
+    monitor_index = get_monitor_under_mouse()
+    if monitor_index is None:
+        print("Could not determine monitor under mouse.")
+        return
+
+    with mss.mss() as sct:
+        # Get fresh monitor info and capture
+        monitor = sct.monitors[monitor_index]
+        screenshot = sct.grab(monitor)
+        mss.tools.to_png(screenshot.rgb, screenshot.size, output="monitor_under_mouse.png")
+        print(f"Screenshot saved as monitor_under_mouse.png (Monitor {monitor_index}: {monitor['width']}x{monitor['height']} at {monitor['left']},{monitor['top']})")
+
+def extract_patient_info(image_path):
+    """Extract patient information from screenshot using Gemini AI"""
+    try:
+        # Set API key from environment variable
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            try:
+                tk.messagebox.showerror(
+                    "Error",
+                    "GEMINI_API_KEY not found.\n\n"
+                    "Make sure a .env file exists next to the executable and contains:\n"
+                    "GEMINI_API_KEY=your_api_key_here",
+                )
+            except Exception:
+                pass
+            raise ValueError("GEMINI_API_KEY not found in environment variables. Please check your .env file.")
+        
+        genai.configure(api_key=api_key)
+        
+        # Load image from file
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        
+        # Select model
+        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        
+        # Generate response
+        response = model.generate_content([
+            {
+                "role": "user",
+                "parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": image_bytes}},
+                    {
+                        "text": (
+                            "From the image provided, extract ONLY the following information, "
+                            "in this exact order, one item per line:\n"
+                            "1) FULL patient name in the format: Last, First Middle\n"
+                            "2) Date of admission/arrival (date only, no time; format as MM/DD/YYYY)\n"
+                            "3) Date of discharge (date only, no time; format as MM/DD/YYYY). "
+                            "If the patient has NOT yet been discharged, output exactly '1/1/2000' for this line.\n"
+                            "4) ICD-10-CM code for the most important neurology-related final diagnosis\n"
+                            "5) ICD-10-CM code for the second neurology-related final diagnosis (if any)\n"
+                            "6) ICD-10-CM code for the third neurology-related final diagnosis (if any)\n"
+                            "7) ICD-10-CM code for the fourth neurology-related final diagnosis (if any)\n\n"
+                            "ICD-10-CM code rules (lines 4-7):\n"
+                            "- You will see a list of final diagnoses from all fields of medicine. "
+                            "Choose ONLY the codes that clearly correspond to conditions a neurologist would diagnose.\n"
+                            "- ICD-10-CM codes are for billing and must justify the need for a neurologist; "
+                            "do NOT include codes that are not clearly neurology-related.\n"
+                            "- You are strongly encouraged to find multiple appropriate codes (up to four), "
+                            "but suitability is more important than quantity.Usually 2-3 is normal for the average patient.\n"
+                            "- If there are more than four applicable neurology codes, choose the four that are most "
+                            "clinically significant and most clearly require neurological expertise.\n"
+                            "- If you are unsure or cannot confidently justify including a code, do NOT include it.\n"
+                            "- If there are fewer than four suitable neurology-related codes, fill the remaining lines "
+                            "with exactly 'NANA'. It is better to use 'NANA' than to force a weak or incorrect code.\n"
+                            "- For each code line that is NOT 'NANA', output the code, followed by '~', followed by the "
+                            "exact description from the image (for example: G81.90~Hemiplegia, unspecified side).\n"
+                            "- If you output 'NANA' on a line, do NOT include any description on that line.\n\n"
+                            "Formatting and constraints:\n"
+                            "- Output exactly SEVEN lines and nothing else.\n"
+                            "- Do NOT include any labels [ 1), 2), 3), etc ], bullet points, or extra words. Only output the requested values.\n"
+                            "- Do NOT give any information that is under the text 'IP Adm. Date/Time Admit Category'.\n"
+                            "- If you cannot find enough information for the patient name, arrival date, or discharge date, "
+                            "output the text 'could not find' for that specific line.\n"
+                            "- ICD-10-CM codes ALWAYS start with a letter. Be very careful not to confuse the letter 'I' "
+                            "with the digit '1'. If it appears that a code starts with '1', you are wrong, and it should be 'I'.\n"
+                            "- Omit any '[P]' markers; they are not part of the actual ICD-10-CM codes.\n"
+                        )
+                    },
+                ]
+            }
+        ])
+        
+        return response.text
+    except Exception as e:
+        print(f"Error extracting information from image: {e}")
+        return None
+
+def unpack_response(response):
+    """Parse the AI response into individual fields"""
+    try:
+        lines = response.strip().split('\n')
+        if len(lines) >= 6:
+            PatientNameFull = lines[0].strip()
+            ArrivalTime = lines[1].strip()
+            DischargeTime = lines[2].strip()
+            ICDCode1 = lines[3].strip()
+            ICDCode2 = lines[4].strip()
+            ICDCode3 = lines[5].strip()
+            ICDCode4 = lines[6].strip()
+
+            PatientName = PatientNameFull
+
+            
+            return PatientName, ArrivalTime, DischargeTime, ICDCode1, ICDCode2, ICDCode3, ICDCode4
+        else:
+            print("Error: AI response doesn't contain enough information")
+            return None
+    except Exception as e:
+        print(f"Error parsing AI response: {e}")
+        return None
+
+def enter_data(coordinates, patient_data, ICDManualMode):
+    """Enter patient data into form fields"""
+    PatientName, ArrivalTime, DischargeTime, ICDCode1, ICDCode2, ICDCode3, ICDCode4 = patient_data
+    if ICDManualMode == True:
+        ICDCode1 = "NANA"
+        ICDCode2 = "NANA"
+        ICDCode3 = "NANA"
+        ICDCode4 = "NANA"
+    print("\nEntering data into form...")
+    print("Please ensure the target application is active and ready to receive input.")
+    print("You have 5 seconds to switch to the target application...")
+    #time.sleep(5)
+    
+    # Enter Patient Name
+    try:
+        coord = coordinates["namexy"]
+        x, y = coord["x"], coord["y"]
+        print(f"Entering Patient Name: {PatientName}")
+        pyautogui.moveTo(x, y, duration=0.1)
+        pyautogui.click()
+        pyautogui.click()
+        pyautogui.write(str(PatientName))
+        time.sleep(0.2)
+        pyautogui.press('tab')
+        time.sleep(2)
+        pyautogui.press('tab')
+        time.sleep(1)
+    except Exception as e:
+        print(f"Error entering Patient Name: {e}")
+    
+    #move to visit and press
+    coord = coordinates["visitxy"]
+    x, y = coord["x"], coord["y"]    
+    pyautogui.moveTo(x, y, duration=0.1)
+    pyautogui.click()
+    time.sleep(0.5)
+
+    time.sleep(1.5)
+
+
+    #move to facility and enter "ST"
+    coord = coordinates["facilityxy"]
+    x, y = coord["x"], coord["y"]    
+    pyautogui.moveTo(x, y, duration=0.1)
+    pyautogui.click()
+    pyautogui.write("ST")
+    time.sleep(0.2)
+    pyautogui.press('tab')
+    time.sleep(1)
+    
+    #move to extra info and press
+    coord = coordinates["infoxy"]
+    x, y = coord["x"], coord["y"]    
+    pyautogui.moveTo(x, y, duration=0.1)
+    pyautogui.click()
+    time.sleep(2)
+
+    #enter dates + hit emergency
+    pyautogui.write(str(ArrivalTime))
+    time.sleep(0.5)
+    pyautogui.press('tab')
+    pyautogui.write(str(DischargeTime))
+    time.sleep(0.5)
+    pyautogui.press('tab')
+    pyautogui.press('tab')
+    pyautogui.press('tab')
+    pyautogui.press('tab')
+    pyautogui.press('space')
+    time.sleep(0.5)
+
+#save and close out of extra info menu
+    pyautogui.press('tab', presses=18)
+    pyautogui.press('space')
+    time.sleep(0.5)
+
+
+    #move to DOS and do stuff
+    pyautogui.press('tab')
+#do stuff later
+    pyautogui.press('tab', presses=12, interval = 0.1)
+
+
+    #paste in ICD codes
+    if ICDCode1 == "NANA":
+        pyautogui.press('tab')
+    else:
+        pyautogui.write(" ".join(ICDCode1.split('~')[:-1]))
+        time.sleep(0.1)
+        pyautogui.press('tab')
+    
+
+    if ICDCode2 == "NANA":
+        pyautogui.press('tab')
+    else:
+        pyautogui.write(" ".join(ICDCode2.split('~')[:-1]))
+        time.sleep(0.1)
+        pyautogui.press('tab')
+
+
+    if ICDCode3 == "NANA":
+        pyautogui.press('tab')
+    else:
+        pyautogui.write(" ".join(ICDCode3.split('~')[:-1]))
+        time.sleep(0.1)
+        pyautogui.press('tab')
+
+
+    if ICDCode4 == "NANA":
+        pyautogui.press('tab')
+    else:
+        pyautogui.write(" ".join(ICDCode4.split('~')[:-1]))
+        time.sleep(0.1)
+        pyautogui.press('tab')    
+
+
+    print("Data entry completed!")
+
+class ChargeChoppedApp:
+    def __init__(self, master=None, cli_mode=False):
+        self.cli_mode = cli_mode
+        self.master = master
+        self.hotkey_enabled = False
+        self.calibration_step_event = threading.Event()
+        self.calibrating = False
+        if not cli_mode:
+            self.master.title("ChargeChopped - AutoEnter V2")
+            self.status_var = tk.StringVar()
+            self.status_label = tk.Label(master, textvariable=self.status_var)
+            self.status_label.pack()
+            self.main_frame = tk.Frame(master)
+            self.main_frame.pack()
+            self.build_gui()
+            self.review_frame = None
+            self.quit_btn = tk.Button(master, text="Quit", command=self.quit_app)
+            self.quit_btn.pack(pady=5)
+            self.master.protocol("WM_DELETE_WINDOW", self.quit_app)
+            keyboard.add_hotkey('`', self.global_hotkey_handler)
+        self.coordinates = None
+        self.image_path = None
+        self.patient_data = None
+        self.review_entries = []
+        self.ICDManualMode = False
+        if not self.cli_mode:
+            self.coordinates = load_coordinates()
+            if not self.coordinates:
+                self.show_info("No saved coordinates found. Please calibrate before continuing.")
+
+
+    def quit_app(self):
+        if self.cli_mode:
+            exit(0)
+        else:
+            self.master.destroy()
+
+    def log(self, msg):
+        if self.cli_mode:
+            print(msg)
+        else:
+            self.status_var.set(msg)
+            self.master.update_idletasks()
+
+    def show_info(self, msg):
+        if self.cli_mode:
+            print(msg)
+        else:
+            tk.messagebox.showinfo("Info", msg)
+
+    def show_error(self, msg):
+        if self.cli_mode:
+            print(f"ERROR: {msg}")
+        else:
+            tk.messagebox.showerror("Error", msg)
+
+    def build_gui(self):
+        self.select_btn = tk.Button(self.main_frame, text="Select Input File", command=self.select_input_gui)
+        self.select_btn.pack(padx=100,pady=5)
+        self.calib_btn = tk.Button(self.main_frame, text="Calibrate Positions", command=self.calibrate_positions_gui)
+        self.calib_btn.pack(pady=5)
+        # Toggle hotkey/manual mode
+        self.toggle_btn = tk.Button(self.main_frame, text="Hotkey Mode: OFF", command=self.toggle_hotkey_mode)
+        self.toggle_btn.pack(pady=5)
+
+    def select_input_gui(self):
+        self.image_path = select_screenshot()
+        if self.image_path:
+            self.log(f"Selected image: {self.image_path}")
+            self.process_image(self.image_path)
+
+    def calibrate_positions_gui(self):
+        self.calibrating = True
+        def status_callback(msg):
+            self.status_var.set(msg)
+            self.master.update_idletasks()
+        self.coordinates = self.calibrate_positions(gui_status_callback=status_callback)
+        save_coordinates(self.coordinates)
+        self.log("Calibration complete.")
+        self.calibrating = False
+
+    def calibrate_positions(self, gui_status_callback=None):
+        print("Calibrating cursor positions...")
+        print("For each field, hover your mouse over the text box and press ` to save the position")
+        print("You can press Ctrl+C at any time to cancel calibration")
+        coordinates = {}
+        fields = [
+            ("Patient Name", "namexy"),
+            ("Visit button", "visitxy"),
+            ("Facility button", "facilityxy"),
+            ("Extra Info button", "infoxy")
+        ]
+        for field_name, coord_key in fields:
+            if gui_status_callback:
+                gui_status_callback(f"Calibrating: {field_name}")
+            print(f"\nHover over {field_name} text box and press ` to save position")
+            print("Press Ctrl+C to cancel")
+            self.calibration_step_event.clear()
+            while True:
+                try:
+                    if self.calibration_step_event.wait(timeout=0.1):
+                        break
+                except KeyboardInterrupt:
+                    print("\nCalibration cancelled.")
+                    sys.exit(1)
+                print(f"\rCurrent position: {pyautogui.position()}", end="", flush=True)
+            position = pyautogui.position()
+            coordinates[coord_key] = {"x": position.x, "y": position.y}
+            print(f"\n{field_name} position saved: {position}")
+            time.sleep(0.5)
+        if gui_status_callback:
+            gui_status_callback("")
+        return coordinates
+
+    def process_image(self, image_path):
+        if not self.coordinates:
+            self.coordinates = load_coordinates()
+        if not self.coordinates:
+            self.show_info("No saved coordinates found. Please calibrate before continuing.")
+            self.calibrate_positions_gui()
+            if not self.coordinates:
+                self.show_error("Calibration failed or cancelled. Cannot continue.")
+                return
+        self.log(f"Extracting patient information from {image_path}...")
+        response = extract_patient_info(image_path)
+        if response is None:
+            self.show_error(f"Failed to extract info from {image_path}")
+            return
+        patient_data = unpack_response(response)
+        if patient_data is None:
+            self.show_error(f"Failed to parse info from {image_path}")
+            return
+        self.patient_data = patient_data
+        confirmed, edited_data, ICDManualMode = self.review_and_confirm(patient_data)
+        if not confirmed:
+            self.log("Data entry cancelled or not confirmed. Skipping this entry.")
+            return
+        # enter_data is now called from review_and_confirm
+        try:
+            os.remove(image_path)
+            self.log(f"Deleted {image_path}")
+        except Exception as e:
+            self.show_error(f"Could not delete {image_path}: {e}")
+
+    def review_and_confirm(self, patient_data):
+        if self.cli_mode:
+            # Terminal mode: print and allow manual edit
+            fields = ["Name", "Arrival Date", "Discharge Date", "ICDCode1", "ICDCode2", "ICDCode3", "ICDCode4"]
+            edited = list(patient_data)
+            for i, (f, v) in enumerate(zip(fields, patient_data)):
+                print(f"{f}: {v}")
+                resp = input(f"Edit {f}? (leave blank to keep): ").strip()
+                if resp:
+                    edited[i] = resp
+            confirm = input("Is the extracted information correct? (yes/no): ").strip().lower() in ["yes", "y"]
+            ICDManualMode = False
+            if not confirm:
+                icd_manual = input("Do you want to input ICD-10 codes manually? (yes/no): ").strip().lower() in ["yes", "y"]
+                if not icd_manual:
+                    print("Information not confirmed. Please try again.")
+                    return False, edited, False
+                else:
+                    ICDManualMode = True
+            ready = input("Are you ready to paste the information? (yes/no): ").strip().lower() in ["yes", "y"]
+            if not ready:
+                print("Data entry cancelled.")
+                return False, edited, ICDManualMode
+            return True, edited, ICDManualMode
+        else:
+            # GUI mode: show editable fields in a modal dialog
+            result = {'confirmed': False, 'edited': list(patient_data), 'ICDManualMode': False}
+            dialog = tk.Toplevel(self.master)
+            dialog.title("Review Extracted Data")
+            fields = ["Name", "Arrival Date", "Discharge Date", "ICDCode1", "ICDCode2", "ICDCode3", "ICDCode4"]
+            entries = []
+            for i, (f, v) in enumerate(zip(fields, patient_data)):
+                tk.Label(dialog, text=f).grid(row=i, column=0, sticky='e')
+                entry = tk.Entry(dialog, width=40)
+                entry.insert(0, v)
+                entry.grid(row=i, column=1)
+                entries.append(entry)
+            icd_manual_var = tk.BooleanVar(value=False)
+            # Add warning label
+            warning = tk.Label(dialog, text="Please ensure the target application is active and ready to receive input. You have 5 seconds to switch to the target application before auto-entry begins.", fg="red", wraplength=350, justify="left")
+            warning.grid(row=len(fields), column=0, columnspan=2, pady=(10,0))
+            def on_confirm():
+                result['confirmed'] = True
+                result['edited'] = [e.get() for e in entries]
+                result['ICDManualMode'] = icd_manual_var.get()
+                dialog.destroy()
+                # Start auto-entry after closing dialog
+                self.master.after(100, lambda: self.master.after(5000, lambda: enter_data(self.coordinates, result['edited'], result['ICDManualMode'])))
+            def on_cancel():
+                result['confirmed'] = False
+                dialog.destroy()
+            btn_frame = tk.Frame(dialog)
+            btn_frame.grid(row=len(fields)+1, column=0, columnspan=2, pady=10)
+            confirm_btn = tk.Button(btn_frame, text="Confirm and Continue", command=on_confirm)
+            confirm_btn.pack(side='left', padx=5)
+            cancel_btn = tk.Button(btn_frame, text="Cancel Entry", command=on_cancel)
+            cancel_btn.pack(side='left', padx=5)
+            icd_manual_cb = tk.Checkbutton(btn_frame, text="Input ICD-10 codes manually", variable=icd_manual_var)
+            icd_manual_cb.pack(side='left', padx=5)
+            dialog.transient(self.master)
+            dialog.grab_set()
+            self.master.wait_window(dialog)
+            if not result['confirmed']:
+                return False, patient_data, False
+            return True, result['edited'], result['ICDManualMode']
+
+    def toggle_hotkey_mode(self):
+        self.hotkey_enabled = not self.hotkey_enabled
+        if self.hotkey_enabled:
+            self.toggle_btn.config(text="Hotkey Mode: ON")
+        else:
+            self.toggle_btn.config(text="Hotkey Mode: OFF")
+
+    def global_hotkey_handler(self):
+        if self.calibrating:
+            self.calibration_step_event.set()
+        elif self.hotkey_enabled:
+            self.take_and_process_screenshot()
+
+    def take_and_process_screenshot(self):
+        screenshot_active_monitor()
+        image_path = "monitor_under_mouse.png"
+        self.process_image(image_path)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cli', action='store_true', help='Run in terminal mode (no GUI)')
+    args = parser.parse_args()
+    if args.cli:
+        # Terminal mode: run the workflow inline
+        print("=== AutoEnter V2 - Charge Entry Tool ===")
+        print("This tool automatically extracts patient information from screenshots")
+        print("and enters it into form fields using saved cursor positions.\n")
+        # Check for saved coordinates
+        coordinates = load_coordinates()
+        if coordinates is None:
+            print("No saved coordinates found. Starting calibration process...")
+            coordinates = calibrate_positions()
+            save_coordinates(coordinates)
+            print("Coordinates saved for future use!")
+        else:
+            print("Found saved coordinates. Skipping calibration.")
+        # Select screenshot
+        print("\nPlease select the screenshot containing patient information...")
+        image_path = select_screenshot()
+        print(f"Selected image: {image_path}")
+        # Extract patient information
+        print("\nExtracting patient information from image...")
+        response = extract_patient_info(image_path)
+        if response is None:
+            print("Failed to extract information. Please try again.")
+            sys.exit(1)
+        print("AI Response:")
+        print(response)
+        # Parse the response
+        patient_data = unpack_response(response)
+        if patient_data is None:
+            print("Failed to parse patient information. Please try again.")
+            sys.exit(1)
+        PatientName, ArrivalTime, DischargeTime, ICDCode1, ICDCode2, ICDCode3, ICDCode4 = patient_data
+        # Display extracted information
+        print("\n=== Extracted Patient Information ===")
+        print(f"Name: {PatientName}")
+        print(f"Arrival Date: {ArrivalTime}")
+        print(f"Discharge Date: {DischargeTime}")
+        print(f"ICDCode1: {ICDCode1}")
+        print(f"ICDCode2: {ICDCode2}")
+        print(f"ICDCode3: {ICDCode3}")
+        print(f"ICDCode4: {ICDCode4}")
+        # Confirm information
+        ICDManualMode = False
+        confirm = input("\nIs the extracted information correct? (yes/no): ").strip().lower()
+        if confirm not in ["yes", "y"]:
+            confirm = input("\nDo you want to input ICD-10 codes manually? (yes/no): ").strip().lower()
+            if confirm not in ["yes", "y"]:
+                print("Information not confirmed. Please try again.")
+                sys.exit(1)
+            else:
+                ICDManualMode = True
+        ready = input("Are you ready to paste the information? (yes/no): ").strip().lower()
+        if ready not in ["yes", "y"]:
+            print("Data entry cancelled.")
+            sys.exit(0)
+        print("Please ensure the target application is active and ready to receive input.\nYou have 5 seconds to switch to the target application...")
+        time.sleep(5)
+        enter_data(coordinates, patient_data, ICDManualMode)
+    else:
+        root = tk.Tk()
+        app = ChargeChoppedApp(root, cli_mode=False)
+        root.mainloop()
